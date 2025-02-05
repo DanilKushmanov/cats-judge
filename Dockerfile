@@ -15,7 +15,8 @@ RUN apt-get update && \
     libxml-parser-perl \
     fpc \
     libdbd-pg-perl \
-    libsql-abstract-perl
+    libsql-abstract-perl \
+    libdbd-firebird-perl
 
 # Add Perl and Git to the PATH
 ENV PATH="/usr/bin/perl:/usr/bin/git:${PATH}"

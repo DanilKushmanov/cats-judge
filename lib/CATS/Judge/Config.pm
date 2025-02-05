@@ -102,7 +102,7 @@ sub apply_defines {
     my $defines = $self->{defines};
     $value =~ s/$_/$defines->{$_}/g
         for sort { length $b <=> length $a || $a cmp $b } keys %$defines;
-    $value =~ s/#env:([a-zA-Z0-9_]+)/$ENV{$1} || die 'Unknown environment ', $1/eg;
+    # $value =~ s/#env:([a-zA-Z0-9_]+)/$ENV{$1} || die 'Unknown environment ', $1/eg; # there's a trouble when using on Linux
     $value;
 }
 
