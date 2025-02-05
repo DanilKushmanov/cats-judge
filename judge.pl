@@ -31,7 +31,6 @@ use CATS::Utils qw(sanitize_file_name split_fname);
 
 use CATS::Backend;
 use CATS::Judge::Config;
-use CATS::Judge::ConfigFile;
 use CATS::Judge::CommandLine;
 use CATS::Judge::Log;
 use CATS::Judge::Local;
@@ -1420,7 +1419,7 @@ $cli->parse;
 
 eval {
     $cfg->load(
-        file => $cli->opts->{'config-file'} || $CATS::Judge::ConfigFile::main,
+        file => $cli->opts->{'config-file'} || $CATS::Judge::Config::main,
         override => $cli->opts->{'config-set'});
 
     my $cfg_confess = $cfg->confess // '';

@@ -18,10 +18,12 @@ use lib File::Spec->catdir($FindBin::Bin, 'lib', 'cats-problem');
 use CATS::ConsoleColor qw(colored);
 use CATS::DevEnv::Detector::Utils qw(globq run);
 use CATS::FileUtil;
-use CATS::Judge::ConfigFile qw(cfg_file);
+use CATS::Judge::Config;
 use CATS::Loggers;
 use CATS::MaybeDie qw(maybe_die);
 use CATS::Spawner::Platform;
+
+*cfg_file = *CATS::Judge::Config::cfg_file;
 
 $| = 1;
 
@@ -95,9 +97,7 @@ sub my_copy {
 }
 
 sub load_cfg {
-    require CATS::Judge::Config;
-    CATS::Judge::Config->import;
-    CATS::Judge::Config->new(root => $FindBin::Bin)->load(file => $CATS::Judge::ConfigFile::main);
+    CATS::Judge::Config->new(root => $FindBin::Bin)->load(file => $CATS::Judge::Config::main);
 }
 
 step 'Verify install', sub {
