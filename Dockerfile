@@ -21,6 +21,8 @@ RUN apt-get update && \
 # Add Perl and Git to the PATH
 ENV PATH="/usr/bin/perl:/usr/bin/git:${PATH}"
 
+ARG CACHEBUST=1
+
 # Clone the cats-judge repository
 RUN git clone https://github.com/DanilKushmanov/cats-judge.git /cats-judge 
 

@@ -241,10 +241,10 @@ step 'Prepare spawner binary', sub {
     unlink $zip_file;
 };
 
-step 'Copy Config.pm', sub {
-    my @p = qw(lib cats-problem CATS);
-    my_copy(File::Spec->catfile(@p, 'Config.pm.template'), File::Spec->catfile(@p, 'Config.pm'));
-};
+# step 'Copy Config.pm', sub {
+#     my @p = qw(lib cats-problem CATS);
+#     my_copy(File::Spec->catfile(@p, 'Config.pm.template'), File::Spec->catfile(@p, 'Config.pm'));
+# };
 
 step 'Copy configuration from templates', sub {
     for (qw(autodetect local local_devenv)) {
