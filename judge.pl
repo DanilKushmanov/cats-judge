@@ -31,6 +31,7 @@ use CATS::Utils qw(sanitize_file_name split_fname);
 
 use CATS::Backend;
 use CATS::Judge::Config;
+use CATS::Judge::ConfigFile;
 use CATS::Judge::CommandLine;
 use CATS::Judge::Log;
 use CATS::Judge::Local;
@@ -98,6 +99,21 @@ sub update_self {
     1;
 }
 
+sub run_command {
+    my ($r) = @_;
+    my $job_src = $r->{job_src} // '';
+    my @commands = split "\n", $job_src;
+    for my $cmd (@commands) {
+        log_msg("Running:\n$cmd\n");
+        my $rr = $fu->run([ split /\s+/, $cmd ]);
+        log_msg("O> $_") for @{$rr->stdout};
+        log_msg("E> $_") for @{$rr->stderr};
+        return log_msg("failure: %s\n", $rr->exit_code) if !$rr->ok || $rr->exit_code;
+    }
+    log_msg("success\n");
+    1;
+}
+
 sub set_name_parts {
     my ($r) = @_;
     (undef, undef, $_->{full_name}, $_->{name}, undef) = split_fname($r->{fname})
@@ -110,15 +126,19 @@ sub get_run_params {
 
     my $is_interactive = $run_info->{method} == $cats::rm_interactive;
     my $is_competititve = $run_info->{method} == $cats::rm_competitive;
+    my $is_comp_modules = $run_info->{method} == $cats::rm_competitive_modules;
 
-    die if !$is_competititve && @$rs != 1;
+    die if !($is_competititve || $is_comp_modules) && @$rs != 1;
 
     my @programs;
 
     my $time_limit_sum = 0;
+    my $safe = 1;
+
     for my $r (@$rs) {
         my %limits = $src_proc->get_limits($r, $problem);
         $time_limit_sum += $limits{time_limit};
+        next if $is_comp_modules;
 
         my $solution_opts;
         if ($is_interactive || $is_competititve) {
@@ -129,10 +149,12 @@ sub get_run_params {
                 %limits, input_output_redir($problem->{input_file}, $problem->{output_file}) };
         }
         $r->{cfg_exit_code} = $src_proc->property(run_exit_code => $r->{de_id});
+        $safe &&= $src_proc->property(safe => $r->{de_id});
         my $run_cmd = $src_proc->require_property(run => $r, {
             %$run_cmd_opts,
             input_file => input_or_default($problem->{input_file}),
             output_file => output_or_default($problem->{output_file}),
+            output_noext => ($problem->{output_file} =~ /^(\w+)\.(?:\w+)$/ ? $1 : 'output'),
             original_output => $problem->{output_file},
         }) or return;
         push @programs, CATS::Spawner::Program->new($run_cmd, [], $solution_opts);
@@ -140,15 +162,19 @@ sub get_run_params {
 
     my $deadline_min = $cfg->default_limits->{deadline_min} // 30;
     my $sd = $time_limit_sum + ($cfg->default_limits->{deadline_add} // 5);
-    my $deadline = $is_competititve ? max($sd, $deadline_min) : $sd;
+    my $deadline = $is_competititve || $is_comp_modules ? max($sd, $deadline_min) : $sd;
 
     my $global_opts = {
         deadline => $deadline,
         idle_time_limit => $cfg->default_limits->{idle_time} // 1,
         stdout => '*null',
+        active_connections => 0,
+        active_processes => 2,
+        ($cfg->sp_user && !$safe ?
+            (user => { name => $cfg->sp_user, password => $cfg->sp_password, }) : ()),
     };
 
-    if ($is_interactive || $is_competititve) {
+    if ($is_interactive || $is_competititve || $is_comp_modules) {
         my $i = $run_info->{interactor}
             or return log_msg("No interactor specified in get_run_params\n");
         my %limits = $src_proc->get_limits($run_info->{interactor}, $problem);
@@ -158,7 +184,8 @@ sub get_run_params {
         my $run_cmd = $src_proc->require_property(run => $i, {}) or return;
 
         unshift @programs, CATS::Spawner::Program->new($run_cmd,
-            $is_competititve ? [ scalar @programs ] : [],
+            $is_competititve ? [ scalar @programs ] :
+            $is_comp_modules ? [ map $_->{name_parts}->{full_name}, @$rs ] : [],
             { controller => $is_competititve, idle_time_limit => $deadline - 1, %limits }
         );
     }
@@ -199,20 +226,39 @@ sub generate_test {
     my $redir;
     my $out = $ps->{output_file} // $input_fname;
     if ($out =~ /^\*STD(IN|OUT)$/) {
-        $test->{gen_group} and return undef;
+        $test->{gen_group} and return;
         $out = 'stdout1.txt';
         $redir = $out;
     }
 
-    my $args = $test->{param} // '';
-    my $generate_cmd = $src_proc->require_property(generate => $ps, { args => $args }) or return;
-    my $sp_report = $sp->run_single({ ($redir ? (stdout => '*null') : ()) },
-        $generate_cmd,
-        [],
-        { $src_proc->get_limits($ps, $problem), stdout => $redir }
-    ) or return undef;
+    my ($args, @pipe) = split /\s*\|\s*/, $test->{param} // '';
+    return log_msg("Pipe reqiures stdout for test #%d", $test->{rank}) if @pipe && !$redir;
 
-    $sp_report->ok ? $out : undef;
+    my $generate_cmd = $src_proc->require_property(generate => $ps, { args => $args }) or return;
+    my %limits = $src_proc->get_limits($ps, $problem);
+    {
+        my $sp_report = $sp->run_single(
+            { ($redir ? (stdout => '*null') : ()) }, $generate_cmd, [], { %limits, stdout => $redir }
+        ) or return;
+        $sp_report->ok or return;
+    }
+
+    my @modules = grep $_->{stype} == $cats::generator_module, @$problem_sources;
+    my $i = 1;
+    for my $pipe_el (@pipe) {
+        my ($cmd, $args1) = $pipe_el =~ /^(\w+)\s*(.*)$/ or return;
+        my ($ps1) = grep $_->{name_parts}->{name} eq $cmd, @modules
+            or return log_msg("Unknown pipe element '%s' for test #%d\n", $cmd, $test->{rank});
+        my $pipe_cmd = $src_proc->require_property(generate => $ps1, { args => $args1 }) or return;
+        #TODO: my %pipe_limits = $src_proc->get_limits($ps1, $problem);
+        my $prev = $out;
+        $out = sprintf('stdout%d.txt', ++$i);
+        my $sp_report = $sp->run_single(
+            {}, $pipe_cmd, [], { %limits, stdin => $prev, stdout => $out }) or return;
+        $sp_report->ok or return;
+    }
+
+    $out;
 }
 
 sub generate_test_group {
@@ -265,6 +311,13 @@ sub get_interactor {
     $interactors[0];
 }
 
+sub _is_group_run {
+    grep $_ == $_[0],
+        ($cats::rm_interactive, $cats::rm_competitive, $cats::rm_competitive_modules)
+}
+
+sub _is_competitive_run { grep $_ == $_[0], ($cats::rm_competitive, $cats::rm_competitive_modules) }
+
 sub prepare_solution_environment {
     my ($pid, $solution_dir, $run_dir, $run_info, $safe) = @_;
 
@@ -272,7 +325,7 @@ sub prepare_solution_environment {
 
     $copy_func->([ @$solution_dir, '*' ], $run_dir) or return;
 
-    if ($run_info->{method} == $cats::rm_interactive || $run_info->{method} == $cats::rm_competitive) {
+    if (_is_group_run($run_info->{method})) {
         my $interactor = $run_info->{interactor} or return;
         if (!$interactor->{legacy}) {
             $copy_func->($problem_cache->source_path($pid, $interactor->{id}, '*'), $run_dir)
@@ -285,11 +338,8 @@ sub prepare_solution_environment {
 
 sub get_run_info {
     my ($run_method) = @_;
-
-    my %p = $run_method == $cats::rm_interactive || $run_method == $cats::rm_competitive ?
-        ( interactor => get_interactor() ) : ();
-
-    { method => $run_method, %p, }
+    my %p = _is_group_run($run_method) ? ( interactor => get_interactor() ) : ();
+    { method => $run_method, %p }
 }
 
 sub validate_test {
@@ -315,11 +365,16 @@ sub validate_test {
     $sp_report->ok;
 }
 
+sub read_lines_for_hash {
+    my ($filename) = @_;
+    my $data = $fu->read_lines($filename, io => ':crlf');
+    join '\n', @$data;
+}
+
 sub check_input_hash {
     my ($pid, $test, $filename) = @_;
 
-    my $data = $fu->read_lines($filename);
-    my $input = join '\n', @$data;
+    my $input = read_lines_for_hash($filename);
 
     my $hash = $test->{in_file_hash};
 
@@ -390,7 +445,7 @@ sub prepare_tests {
             $fu->write_to_file($af, $t->{out_file}) or return;
         }
         elsif (defined $t->{std_solution_id}) {
-            if ($problem->{run_method} == $cats::rm_competitive) {
+            if (_is_competitive_run($problem->{run_method})) {
                 return log_msg("run solution in competitive problem not implemented");
             }
 
@@ -418,8 +473,7 @@ sub prepare_tests {
             ) if $problem->{save_answer_prefix} && !defined $t->{out_file};
         }
         elsif (!defined $t->{snippet_name}) {
-            log_msg("no output file defined for test #$t->{rank}\n");
-            return undef;
+            return log_msg("no output file defined for test #$t->{rank}\n");
         }
     }
 
@@ -429,6 +483,7 @@ sub prepare_tests {
 sub prepare_modules {
     my ($stype) = @_;
     # Select modules in order they are listed in problem definition xml.
+    # FIXME: It is currently all local modules after all imports.
     for my $m (grep $_->{stype} == $stype, @$problem_sources) {
         my $fname = $m->{name_parts}->{full_name};
         log_msg("module: $fname\n");
@@ -457,9 +512,9 @@ sub initialize_problem {
     $main_source_types{$_} = 1 for keys %cats::source_modules;
 
     for my $ps (grep $main_source_types{$_->{stype}}, @$problem_sources) {
-        clear_rundir or return undef;
+        clear_rundir or return;
 
-    (prepare_modules($cats::source_modules{$ps->{stype}} || 0) // -1) == $cats::st_testing or return;
+        (prepare_modules($cats::source_modules{$ps->{stype}} || 0) // -1) == $cats::st_testing or return;
 
         $fu->write_to_file([ $cfg->rundir, $ps->{name_parts}->{full_name} ], $ps->{src}) or return;
 
@@ -557,7 +612,7 @@ sub run_checker {
         $checker_cmd = CATS::Judge::Config::apply_params($checker_cmd, $checker_params);
         %limits = $src_proc->get_limits({}, $problem);
     }
-    else {
+    elsif ($problem->{checker_id}) {
         my ($ps) = grep $_->{id} eq $problem->{checker_id}, @$problem_sources;
 
         my_safe_copy(
@@ -574,6 +629,9 @@ sub run_checker {
         %limits = $src_proc->get_limits($ps, $problem);
 
         $checker_cmd = $src_proc->require_property(check => $ps, $checker_params) or return;
+    }
+    else { # No checker defined, assume 'OK'.
+        return [ { exit_code => 0 } ];
     }
 
     my $sp_report = $sp->run_single({ duplicate_output => \my $output },
@@ -616,6 +674,7 @@ sub run_single_test {
 
     for my $req (@$r) {
         push @$test_run_details, { req_id => $req->{id}, test_rank => $p{rank}, checker_comment => '' };
+        # TODO: Copy interactor once after loop.
         prepare_solution_environment($problem->{id},
             [ $cfg->solutionsdir, $req->{id} ], $cfg->rundir, $problem->{run_info}, 1) or return;
     }
@@ -623,7 +682,7 @@ sub run_single_test {
     my $tf = $problem_cache->test_file($problem->{id}, \%p);
     my_safe_copy($tf, input_or_default($problem->{input_file}), $problem->{id}) or return;
 
-    my $competitive_test_output;
+    my $competitive_test_output = {};
     {
 
         my @run_params = get_run_params($problem, $r, { test_rank => sprintf('%02d', $p{rank}) })
@@ -635,13 +694,14 @@ sub run_single_test {
                 $TR_TIME_LIMIT     => $cats::st_time_limit_exceeded,
                 $TR_MEMORY_LIMIT   => $cats::st_memory_limit_exceeded,
                 $TR_WRITE_LIMIT    => $cats::st_write_limit_exceeded,
-                $TR_IDLENESS_LIMIT => $cats::st_idleness_limit_exceeded
+                $TR_IDLENESS_LIMIT => $cats::st_idleness_limit_exceeded,
+                # $TR_SECURITY       => log_msg("security problem, setting UH\n"),
             }->{$_[0]} // log_msg("unknown terminate reason: $_[0]\n");
         };
 
         my $sp_report = $sp->run(@run_params) or return;
         my @report_items = @{$sp_report->items};
-        if ($problem->{run_method} == $cats::rm_interactive || $problem->{run_method} == $cats::rm_competitive) {
+        if (_is_group_run($problem->{run_method} )) {
             my $interactor_report = shift @report_items;
             if (!$interactor_report->ok && $interactor_report->{terminate_reason} != $TR_IDLENESS_LIMIT) {
                 return;
@@ -672,14 +732,14 @@ sub run_single_test {
             }
 
             save_output_prefix($test_run_details->[$i], $problem, $r->[$i])
-                if $problem->{run_method} != $cats::rm_competitive;
+                if !_is_competitive_run($problem->{run_method});
         }
 
         save_output_prefix($competitive_test_output, $problem, $r->[0]) # Controller is always first.
-            if $problem->{run_method} == $cats::rm_competitive;
+            if _is_competitive_run($problem->{run_method});
 
         return $test_run_details
-            if $problem->{run_method} != $cats::rm_competitive && $result != $cats::st_accepted;
+            if !_is_competitive_run($problem->{run_method}) && $result != $cats::st_accepted;
     }
 
     my_safe_copy($tf, input_or_default($problem->{input_file}), $problem->{id}) or return;
@@ -687,19 +747,20 @@ sub run_single_test {
     if (defined $p{snippet_name}) {
         # @$r[0]
         my $snippet_answer = $judge->get_snippet_text(
-            $problem->{id}, $r->[0]->{contest_id}, $r->[0]->{account_id}, $p{snippet_name});
-        defined $snippet_answer or return log_msg('Answer snippet not found');
-        my $out = $problem_cache->answer_file($problem->{id}, \%p);
-        $fu->write_to_file($out, $snippet_answer);
+            $problem->{id}, $r->[0]->{contest_id}, $r->[0]->{account_id}, [ $p{snippet_name} ])->[0];
+        defined $snippet_answer or return log_msg("Answer snippet '%s' not found\n", $p{snippet_name});
+        $fu->write_to_file([ $cfg->rundir, "$p{rank}.ans" ], $snippet_answer) or return;
     }
-
-    my_safe_copy(
-        $problem_cache->answer_file($problem->{id}, \%p),
-        [ $cfg->rundir, "$p{rank}.ans" ], $problem->{id}) or return;
+    else {
+        my_safe_copy(
+            $problem_cache->answer_file($problem->{id}, \%p),
+            [ $cfg->rundir, "$p{rank}.ans" ], $problem->{id}) or return;
+    }
 
     {
         my $checker_result = run_checker(problem => $problem, rank => $p{rank}) or return;
-        my ($sp_report, $checker_output, $checker_points) = @$checker_result;
+        my ($sp_checker_report, $checker_output, $checker_points) = @$checker_result;
+        my $checker_exit_code = $sp_checker_report->{exit_code};
 
         my $save_comment = sub {
             #Encode::from_to($$c, 'cp866', 'utf8');
@@ -716,10 +777,11 @@ sub run_single_test {
         };
 
         my $result = $cats::st_accepted;
-        if ($problem->{run_method} == $cats::rm_competitive) {
-            return log_msg("competitive checker exit code is not zero (exit code '$sp_report->{exit_code}')\n")
-                if $sp_report->{exit_code} != 0;
+        if (_is_competitive_run($problem->{run_method})) {
+            return log_msg("competitive checker exit code is not zero (exit code '$checker_exit_code')\n")
+                if $checker_exit_code != 0;
             $checker_output or return log_msg("competitive checker stdout is empty\n");
+            $checker_points = '';
             for my $line (split(/[\r\n]+/, $checker_output)) {
                 my @agent_result = split(/\t/, $line);
                 return log_msg("competitive checker stdout bad format\n") if @agent_result < 3;
@@ -729,9 +791,10 @@ sub run_single_test {
                     if $agent < 0 || $agent > @$test_run_details;
 
                 my $agent_verdict = $get_verdict->($agent_result[1]) // return;
-                $result = $agent_verdict if $agent_verdict != $cats::st_accepted;
+                #$result = $agent_verdict if $agent_verdict != $cats::st_accepted;
                 $test_run_details->[$agent]->{result} = $agent_verdict;
                 $test_run_details->[$agent]->{points} = int $agent_result[2];
+                $checker_points .= " $agent_result[2]";
                 $save_comment->($agent, $agent_result[3]) if $agent_result[3];
             }
             0 == grep !defined $_->{result}, @$test_run_details
@@ -739,7 +802,7 @@ sub run_single_test {
         } else {
             $save_comment->(0, $checker_output) if defined $checker_output;
             $result = $test_run_details->[0]->{result} =
-                $get_verdict->($sp_report->{exit_code}) // return;
+                $get_verdict->($checker_exit_code) // return;
             if ($result == $cats::st_accepted && defined $checker_points) {
                 $test_run_details->[0]->{points} = $checker_points;
             }
@@ -793,6 +856,7 @@ sub compile {
         $r->{fname} = $main->{fname};
         set_name_parts($r);
     } else {
+        # TODO: Prevent name conflicts in competitive runs!!
         $fu->write_to_file([ $cfg->rundir, $r->{name_parts}->{full_name} ], $r->{src}) or return;
     }
 
@@ -822,14 +886,15 @@ sub compile {
 }
 
 sub run_testplan {
-    my ($tp, $problem, $requests, %tests_snippet_names) = @_;
+    my ($tp, $problem, $requests, $tests_snippet_names) = @_;
     $inserted_details{$_->{id}} = {} for @$requests;
     my $run_verdict = $cats::st_accepted;
+    my $is_competitive = _is_competitive_run($problem->{run_method});
     my $competitive_outputs = {};
     for ($tp->start; $tp->current; ) {
         (my $test_run_details, $competitive_outputs->{$tp->current}) =
             run_single_test(problem => $problem, requests => $requests, rank => $tp->current,
-                snippet_name => $tests_snippet_names{$tp->current}) or return;
+                snippet_name => $tests_snippet_names->{$tp->current}) or return;
         # In case run_single_test returns a list of single undef via log_msg.
         $test_run_details or return;
         my $test_verdict = $cats::st_accepted;
@@ -839,13 +904,16 @@ sub run_testplan {
             $test_verdict = $details->{result} if $test_verdict == $cats::st_accepted;
             insert_test_run_details(%$details) or return;
             $inserted_details{$details->{req_id}}->{$tp->current} = $details->{result};
-            $judge->set_request_state($requests->[$i], $details->{result}, $current_job_id, %{$requests->[$i]})
-                or return if $problem->{run_method} == $cats::rm_competitive;
+            if ($is_competitive) {
+                $judge->set_request_state(
+                    $requests->[$i], $details->{result}, $current_job_id, %{$requests->[$i]}) or return;
+            }
         }
 
         my $ok = $test_verdict == $cats::st_accepted ? 1 : 0;
         # For a run, set verdict to the lowest ranked non-accepted test verdict.
-        $run_verdict = $test_verdict if !$ok && $tp->current < ($tp->first_failed || 1e10);
+        $run_verdict = $test_verdict
+            if !$ok && $tp->current < ($tp->first_failed || 1e10) && !$is_competitive;
         $tp->set_test_result($ok);
     }
     ($run_verdict, $competitive_outputs);
@@ -972,7 +1040,8 @@ sub split_solution {
 sub test_solution {
     my ($r, $problem) = @_;
 
-    log_msg("Testing solution part: $r->{id} for problem: $r->{problem_id}\n");
+    $log->colored($cfg->color->{testing_start})->
+        msg("Testing solution part: $r->{id} for problem: $r->{problem_id}\n");
 
     $problem->{run_info} = get_run_info($problem->{run_method});
 
@@ -980,9 +1049,11 @@ sub test_solution {
         { ($cats::source_modules{$_->{stype}} || -1) == $cats::checker_module }
         @$problem_sources;
 
-    if (!defined $problem->{checker_id} && !defined $problem->{std_checker}) {
-        log_msg("no checker defined!\n");
-        return;
+    if (
+        $problem->{run_method} != $cats::rm_none &&
+        !defined $problem->{checker_id} && !defined $problem->{std_checker}
+    ) {
+        return log_msg("no checker defined!\n");
     }
 
     my ($is_group_req, @run_requests) = get_run_reqs($r);
@@ -999,7 +1070,7 @@ sub test_solution {
             return $st if !$st || $st != $cats::st_testing;
         }
         my %tests =
-            $problem->{run_method} == $cats::rm_competitive || $r->{type} == $cats::job_type_submission ?
+            _is_competitive_run($problem->{run_method}) || $r->{type} == $cats::job_type_submission ?
             $judge->get_testset('reqs', $r->{id}, 1) : $judge->get_testset('jobs', $r->{job_id});
 
         %tests or do {
@@ -1010,10 +1081,10 @@ sub test_solution {
         my %tests_snippet_names = map { $_->{rank} => $_->{snippet_name} } @$problem_tests;
         my %tp_params = (tests => \%tests);
 
-        if ($problem->{run_method} == $cats::rm_competitive) {
+        if (_is_competitive_run($problem->{run_method})) {
             my $tp = CATS::TestPlan::All->new(%tp_params);
             ($solution_status, my $test_outputs) =
-                run_testplan($tp, $problem, \@run_requests, %tests_snippet_names) or return;
+                run_testplan($tp, $problem, \@run_requests, \%tests_snippet_names) or return;
             if (my $failed_test = $tp->first_failed) {
                 $r->{failed_test} = $failed_test;
             }
@@ -1029,7 +1100,8 @@ sub test_solution {
                 my $tp = $r->{run_all_tests} ?
                     CATS::TestPlan::ScoringGroups->new(%tp_params) :
                     CATS::TestPlan::ACM->new(%tp_params);
-                my ($run_verdict, undef) = run_testplan($tp, $problem, [ $run_req ], %tests_snippet_names) or return;
+                my ($run_verdict, undef) =
+                    run_testplan($tp, $problem, [ $run_req ], \%tests_snippet_names) or return;
                 if (my $failed_test = $tp->first_failed) {
                     $run_req->{failed_test} = $r->{failed_test} = $failed_test;
                 }
@@ -1077,7 +1149,8 @@ sub prepare_problem {
     my $state = $cats::st_testing;
     my $is_ready = $problem_cache->is_ready($r->{problem_id});
     if (!$is_ready || $cli->opts->{'force-install'}) {
-        log_msg("installing problem $r->{problem_id}%s\n", $is_ready ? ' - forced' : '');
+        $log->colored($cfg->color->{install_start})->
+            msg("installing problem $r->{problem_id}%s\n", $is_ready ? ' - forced' : '');
         eval {
             $r->{type} == $cats::job_type_initialize_problem ? 
             initialize_problem($r->{problem_id}) : initialize_problem_wrapper($r->{problem_id});
@@ -1085,12 +1158,13 @@ sub prepare_problem {
             $state = $cats::st_unhandled_error;
             log_msg("error: $@\n") if $@;
         };
-        log_msg(
-            "problem '$r->{problem_id}' " .
-            ($state != $cats::st_unhandled_error ? "installed\n" : "failed to install\n"));
+        $log->colored(
+            $cfg->color->{$state != $cats::st_unhandled_error ? 'install_ok' : 'install_fail'})->
+            msg("problem '%s' %s\n", $r->{problem_id},
+                ($state != $cats::st_unhandled_error ? 'installed' : 'failed to install'));
     }
     else {
-        log_msg("problem '$r->{problem_id}' cached\n");
+        $log->colored($cfg->color->{problem_cached})->msg("problem '$r->{problem_id}' cached\n");
     }
 
     $judge->set_request_state($r, $state, $current_job_id, %$r) if $state == $cats::st_unhandled_error;
@@ -1159,7 +1233,6 @@ sub set_verdict {
 sub test_problem {
     my ($r, $problem) = @_;
 
-    log_msg("test log:\n");
     my $orig_name = $r->{fname};
     sanitize_file_name($r->{fname}) and log_msg("renamed from '$orig_name'\n");
 
@@ -1197,32 +1270,46 @@ sub test_problem {
 sub generate_snippets {
     my ($r) = @_;
 
+    my $problem = $judge->get_problem($r->{problem_id});
     # TODO: move to select_request
     my $snippets = $judge->get_problem_snippets($r->{problem_id});
-    my $tags = $judge->get_problem_tags($r->{problem_id}, $r->{contest_id}) // '';
+    my $tags = $judge->get_problem_tags($r->{problem_id}, $r->{contest_id}, $r->{account_id}) // '';
     $tags =~ s/\s+//g;
 
     my $generators = {};
-    push @{$generators->{$_->{generator_id}} //= []}, $_->{name} for @$snippets;
+    push @{$generators->{$_->{generator_id}} //= []}, $_->{name} for grep $_->{generator_id}, @$snippets;
 
     my $job_state = $cats::job_st_finished;
+    my $results = {};
     eval {
-        for my $gen_id (keys %$generators) {
-            my ($ps) = grep $_->{id} == $gen_id, @$problem_sources or die;
+        clear_rundir or die;
 
-            clear_rundir or die;
+        my $old_snippets = $judge->get_snippet_text(
+            $r->{problem_id}, $r->{contest_id}, $r->{account_id}, [ map $_->{name}, @$snippets ]);
+        for (my $i = 0; $i < @$snippets; ++$i) {
+            $fu->write_to_file([ $cfg->rundir, $snippets->[$i]->{name} ], $old_snippets->[$i] // '') or die;
+        }
+
+        for my $gen_id (sort keys %$generators) {
+            my ($ps) = grep $_->{id} == $gen_id, @$problem_sources or die;
 
             $fu->copy($problem_cache->source_path($r->{problem_id}, $gen_id, '*'), $cfg->rundir) or die;
 
             my $generate_cmd = $src_proc->require_property(generate => $ps, { args => '' }) or die;
-            my $sp_report = $sp->run_single({}, $generate_cmd, [ $tags ]) or die; #TODO limits
+            my %limits = $src_proc->get_limits($ps, $problem);
+            my $sp_report = $sp->run_single(
+                { save_output => 1, show_output => 1 }, $generate_cmd, [ $tags ], \%limits) or die;
+            $sp_report->ok or die;
 
-            for my $sn (@{$generators->{$gen_id}}) {
-                CATS::BinaryFile::load(CATS::FileUtil::fn([$cfg->rundir, $sn]), \my $data);
-                $judge->save_problem_snippet($r->{problem_id}, $r->{contest_id}, $r->{account_id},
-                    $sn, $data) or die;
+            my @snippet_names = @{$generators->{$gen_id}};
+            for my $sn (@snippet_names) {
+                CATS::BinaryFile::load(CATS::FileUtil::fn([ $cfg->rundir, $sn ]), \my $data);
+                $results->{$sn} = $data;
             }
+            log_msg("Generated: %s\n", join ', ', sort @snippet_names);
         }
+        $judge->save_problem_snippets(
+            $r->{problem_id}, $r->{contest_id}, $r->{account_id}, $results) or die;
         1;
     } or do { log_msg($@); $job_state = $cats::job_st_failed; };
 
@@ -1239,13 +1326,17 @@ sub main_loop {
     chdir $cfg->workdir
         or return log_msg("change to workdir '%s' failed: $!\n", $cfg->workdir);
 
-    my $sp = $cfg->{defines}->{'#spawner'};
-    -x $sp or log_msg("Spawner not found: %s\n", $sp);
+    -x $sp->{sp} or log_msg("Spawner not found at: %s\n", $sp->{sp});
     log_msg("judge: %s, api: %s, version: %s\n", $judge->name, $cfg->api, $judge->version);
     log_msg("supported DEs: %s\n", join ',', sort { $a <=> $b } keys %{$cfg->DEs});
 
+    my $current_sleep = 0;
     for (my $i = 0; !$cfg->restart_count || $i < $cfg->restart_count; $i++) {
-        sleep $cfg->sleep_time;
+        sleep $current_sleep;
+        $current_sleep =
+            $current_sleep * 2 > $cfg->sleep_time ? $cfg->sleep_time :
+            $current_sleep == 0 ? 1 :
+            $current_sleep * 2;
         $log->rollover;
         syswrite STDOUT, "\b" . (qw(/ - \ |))[$i % 4];
         my $timer = timer_start;
@@ -1258,6 +1349,7 @@ sub main_loop {
             log_msg("pong\n");
         }
         $r or next;
+        $current_sleep = 0;
 
         $current_job_id = $r->{job_id};
         $log->clear_dump;
@@ -1267,6 +1359,12 @@ sub main_loop {
             $judge->finish_job($r->{job_id}, $updated ? $cats::job_st_finished : $cats::job_st_failed);
             $judge->save_logs($r->{job_id}, $log->get_dump);
             $updated ? exit : next;
+        }
+
+        if ($r->{type} == $cats::job_type_run_command) {
+            $judge->finish_job($r->{job_id}, run_command($r) ? $cats::job_st_finished : $cats::job_st_failed);
+            $judge->save_logs($r->{job_id}, $log->get_dump);
+            next;
         }
 
         my $state = prepare_problem($r);
@@ -1292,7 +1390,7 @@ sub main_loop {
                 $r->{split_strategy} = get_split_strategy($r);
                 my $problem = $judge->get_problem($r->{problem_id});
 
-                if ($problem->{run_method} == $cats::rm_competitive ||
+                if (_is_competitive_run($problem->{run_method}) ||
                     $r->{type} == $cats::job_type_submission_part ||
                     $r->{split_strategy}->{method} eq $cats::split_none) {
                         test_problem($r, $problem);
@@ -1321,7 +1419,9 @@ sub main_loop {
 $cli->parse;
 
 eval {
-    $cfg->load(file => 'config.xml', override => $cli->opts->{'config-set'});
+    $cfg->load(
+        file => $cli->opts->{'config-file'} || $CATS::Judge::ConfigFile::main,
+        override => $cli->opts->{'config-set'});
 
     my $cfg_confess = $cfg->confess // '';
     $SIG{__WARN__} = sub { log_msg($cfg_confess =~ /w/i ? longmess(@_) : shortmess(@_)) };
@@ -1419,9 +1519,7 @@ elsif ($cli->command =~ /^(clear-cache)$/) {
     $problem_cache->remove_current;
 }
 elsif ($cli->command =~ /^(hash)$/) {
-    my $data = $fu->read_lines($cli->opts->{file});
-    my $input = join '\n', @$data;
-    print '$sha$' . sha1_hex($input);
+    print '$sha$' . sha1_hex(read_lines_for_hash($cli->opts->{file}));
 }
 elsif ($cli->command =~ /^(install|run)$/) {
     for my $rr (@{$cli->opts->{run} || [ '' ]}) {

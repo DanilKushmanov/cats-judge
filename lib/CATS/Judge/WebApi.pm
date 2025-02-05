@@ -9,6 +9,7 @@ use File::Temp;
 use HTTP::Request::Common;
 use JSON::XS;
 use LWP::UserAgent;
+use MIME::Base64 ();
 
 use CATS::DeBitmaps;
 use CATS::DevEnv;
@@ -127,12 +128,13 @@ sub get_problem_snippets {
 }
 
 sub get_problem_tags {
-    my ($self, $pid, $cid) = @_;
+    my ($self, $pid, $cid, $aid) = @_;
 
     my $response = $self->get_json([
         f => 'api_judge_get_problem_tags',
         pid => $pid,
         cid => $cid,
+        aid => $aid,
         sid => $self->{sid},
     ]);
 
@@ -142,20 +144,20 @@ sub get_problem_tags {
 }
 
 sub get_snippet_text {
-    my ($self, $problem_id, $contest_id, $account_id, $name) = @_;
+    my ($self, $problem_id, $contest_id, $account_id, $names) = @_;
 
     my $response = $self->get_json([
         f => 'api_judge_get_snippet_text',
         pid => $problem_id,
         cid => $contest_id,
         uid => $account_id,
-        name => $name,
+        (map { +name => $_ } @$names),
         sid => $self->{sid},
     ]);
 
     die "get_snippet_text: $response->{error}" if $response->{error};
 
-    $response->{text};
+    $response->{texts};
 }
 
 sub get_problem_sources {
@@ -231,6 +233,7 @@ sub set_request_state {
         req_id => $req->{id},
         state => $state,
         job_id => $job_id,
+        account_id  => $p{account_id},
         problem_id => $p{problem_id},
         contest_id => $p{contest_id},
         failed_test => $p{failed_test} // '',
@@ -377,6 +380,9 @@ my @req_retails_params = qw(
 sub insert_req_details {
     my ($self, $job_id, $p) = @_;
 
+    if (exists $p->{output}) {
+        $p->{output} = MIME::Base64::encode_base64($p->{output}, '');
+    }
     my $response = $self->get_json([
         f => 'api_judge_insert_req_details',
         job_id => $job_id,
@@ -396,7 +402,7 @@ sub save_input_test_data {
         f => 'api_judge_save_input_test_data',
         problem_id => $problem_id,
         test_rank => $test_rank,
-        input => $input,
+        input => MIME::Base64::encode_base64($input // '', ''),
         input_size => $input_size,
         hash => $hash,
         sid => $self->{sid},
@@ -412,7 +418,7 @@ sub save_answer_test_data {
         f => 'api_judge_save_answer_test_data',
         problem_id => $problem_id,
         test_rank => $test_rank,
-        answer => $answer,
+        answer => MIME::Base64::encode_base64($answer, ''),
         answer_size => $answer_size,
         sid => $self->{sid},
     ]);
@@ -420,16 +426,17 @@ sub save_answer_test_data {
     die "save_answer_test_data: $response->{error}" if $response->{error};
 }
 
-sub save_problem_snippet {
-    my ($self, $problem_id, $contest_id, $account_id, $snippet_name, $text) = @_;
+# snippets: { name => text }
+sub save_problem_snippets {
+    my ($self, $problem_id, $contest_id, $account_id, $snippets) = @_;
 
     my $response = $self->get_json([
-        f => 'api_judge_save_problem_snippet',
+        f => 'api_judge_save_problem_snippets',
         problem_id => $problem_id,
         contest_id => $contest_id,
         account_id => $account_id,
-        snippet_name => $snippet_name,
-        text => $text,
+        (map { +name => $_ } sort keys %$snippets),
+        (map { +text => $snippets->{$_} // '' } sort keys %$snippets),
         sid => $self->{sid},
     ]);
 

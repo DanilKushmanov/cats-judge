@@ -63,8 +63,8 @@ sub compile {
     $de->{compile} or return $cats::st_testing;
 
     my %env;
-    if (my $add_path = $self->property(compile_add_path => $de_id)) {
-        my $path = apply_params($add_path, { %$name_parts, PATH => $ENV{PATH} });
+    if ($de->{compile_add_path}) {
+        my $path = apply_params($de->{compile_add_path}, { %$name_parts, PATH => $ENV{PATH} });
         %env = (env => { PATH => $path });
     }
 
@@ -73,18 +73,36 @@ sub compile {
         @cats::limits_fields;
     $limits{deadline} = $limits{time_limit} if $limits{time_limit};
 
-    my $sp_report = $self->sp->run_single({
-        ($opt->{section} ? (section => $cats::log_section_compile) : ()),
-        encoding => $de->{encoding},
-        %limits, %env },
-        apply_params($de->{compile}, $name_parts)
-    ) or return;
+    if ($de->{compile_precompile}) {
+        my $sp_report = $self->sp->run_single({
+            encoding => $de->{encoding},
+            %limits, %env },
+            apply_params($de->{compile_precompile}, $name_parts)
+        ) or return;
+        $sp_report->ok or return;
+    }
 
-    return if @{$sp_report->errors} ||
-        0 == grep $sp_report->{terminate_reason} == $_,
-            $TR_OK, $TR_TIME_LIMIT, $TR_MEMORY_LIMIT, $TR_WRITE_LIMIT;
+    my @compile_stages = split /\|/, $de->{compile};
+    my $ok;
+    my $show_section = $opt->{section};
+    my $stage = 1;
+    for my $stage_cmd (@compile_stages) {
+        $self->log->msg("Stage %d:\n", $stage++) if @compile_stages > 1;
+        my $sp_report = $self->sp->run_single({
+            ($show_section ? (section => $cats::log_section_compile) : ()),
+            show_output => 1,
+            save_output => 1,
+            encoding => $de->{encoding},
+            %limits, %env },
+            apply_params($stage_cmd, $name_parts)
+        ) or return;
+        $show_section = undef;
 
-    my $ok = $sp_report->ok;
+        return if @{$sp_report->errors} ||
+            0 == grep $sp_report->{terminate_reason} == $_,
+                $TR_OK, $TR_TIME_LIMIT, $TR_MEMORY_LIMIT, $TR_WRITE_LIMIT;
+        $ok = $sp_report->ok or last;
+    }
 
     if ($ok && $de->{compile_error_flag}) {
         my $re = qr/\Q$cats::log_section_start_prefix$cats::log_section_compile\E\n\Q$de->{compile_error_flag}\E/m;
