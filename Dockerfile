@@ -16,7 +16,29 @@ RUN apt-get update && \
     fpc \
     libdbd-pg-perl \
     libsql-abstract-perl \
-    libdbd-firebird-perl
+    libdbd-firebird-perl \
+    gcc \
+    g++ \
+    clang \
+    openjdk-8-jdk \
+    maven \
+    golang-go \
+    kotlin \
+    ghc \
+    ruby-full \
+    php \
+    erlang \
+    nodejs \
+    swi-prolog \
+    pypy3 \
+    r-base \
+    fpc \
+    rustc \
+    nasm \
+    fp-compiler \
+    mono-devel \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Add Perl and Git to the PATH
 ENV PATH="/usr/bin/perl:/usr/bin/git:${PATH}"
