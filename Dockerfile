@@ -22,12 +22,12 @@ RUN apt-get update && \
 ENV PATH="/usr/bin/perl:/usr/bin/git:${PATH}"
 
 # Clone the cats-judge repository
-RUN git clone https://github.com/DanilKushmanov/cats-judge.git /cats-judge
+RUN git clone https://github.com/DanilKushmanov/cats-judge.git /cats-judge 
 
 # Set the working directory
 WORKDIR /cats-judge
 
-RUN git submodule init && git submodule update
+RUN git submodule init && git submodule update && git checkout currentDev
 
 RUN bash -c "apt-get install -y cpanminus build-essential libfile-copy-recursive-perl libxml-parser-perl fpc"
 
